@@ -1,0 +1,26 @@
+# Installation Guide for Renewable Energy Trading Project
+
+1. Install Docker and Docker Compose
+   - https://docs.docker.com/get-docker/
+
+2. Clone the repository or extract the project files:
+   $ unzip Renewable_Energy_Trading.zip
+   $ cd Renewable_Energy_Trading
+
+3. Build and run the services:
+   $ docker-compose up --build
+
+4. Access the dashboard:
+   http://localhost:8501
+
+5. Trigger a manual forecast:
+   Use the sidebar 'Refresh Forecast' button on the dashboard.
+
+6. Forecast auto-updates every hour using the cron container.
+
+Dependencies:
+- Python 3.9+
+- Docker
+- Streamlit
+- FastAPI
+- scikit-learn, pandas, matplotlib, plotly
