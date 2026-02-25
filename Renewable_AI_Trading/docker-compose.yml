@@ -1,16 +1,29 @@
+# docker-compose.yml
+# ====================
+# Starts all 5 microservices with one command: docker-compose up --build
+#
+# Services start in order (depends_on):
+#   1. data_service    → fetches weather + ERCOT prices
+#   2. forecast        → loads ML models, waits for data_service
+#   3. rag             → loads knowledge base + news, needs GEMINI_API_KEY
+#   4. trading         → calls forecast + rag, manages trades in SQLite
+#   5. dashboard       → calls all services, displays everything
+#   6. scheduler       → triggers pipeline every 15 minutes
+
 services:
-  forecast_cron:
-    build: ./forecast_cron
-    depends_on:
-      - forecast
-    networks:
-      - default
-  weather:
-    build: ./weather_service
+
+  data_service:
+    build: ./data_service
     ports:
       - "8001:8001"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    volumes:
+      - training_data:/app/data
     env_file:
       - .env
+    restart: unless-stopped
 
   forecast:
     build: ./forecast_service
@@ -18,20 +31,75 @@ services:
       - "8002:8002"
     volumes:
       - ./models:/app/models
-      - ./data:/app/data
+      - training_data:/app/data
+    environment:
+      - DATA_SERVICE_URL=http://data_service:8001
+      - MODEL_DIR=models
+    depends_on:
+      - data_service
+    restart: unless-stopped
+
+  rag:
+    build: ./rag_service
+    ports:
+      - "8004:8004"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    env_file:
+      - .env
+    depends_on:
+      - data_service
+    restart: unless-stopped
 
   trading:
     build: ./trading_service
     ports:
       - "8003:8003"
+    volumes:
+      - trading_data:/app/data
+    environment:
+      - FORECAST_SERVICE_URL=http://forecast:8002
+      - RAG_SERVICE_URL=http://rag:8004
+      - DB_PATH=data/trading.db
+    depends_on:
+      - forecast
+      - rag
+    restart: unless-stopped
 
   dashboard:
     build: ./dashboard
     ports:
       - "8501:8501"
-    volumes:
-      - ./data:/app/data
+    environment:
+      - DATA_SERVICE_URL=http://data_service:8001
+      - FORECAST_SERVICE_URL=http://forecast:8002
+      - TRADING_SERVICE_URL=http://trading:8003
+      - RAG_SERVICE_URL=http://rag:8004
     depends_on:
-      - weather
+      - data_service
       - forecast
       - trading
+      - rag
+    restart: unless-stopped
+
+  # Scheduler: triggers the pipeline every 15 minutes
+  # Replaces the old forecast_cron service
+  # Runs: fetch weather → fetch ERCOT → run forecast → execute trade → refresh news
+  scheduler:
+    build: ./scheduler
+    environment:
+      - DATA_SERVICE_URL=http://data_service:8001
+      - FORECAST_SERVICE_URL=http://forecast:8002
+      - TRADING_SERVICE_URL=http://trading:8003
+      - RAG_SERVICE_URL=http://rag:8004
+    depends_on:
+      - data_service
+      - forecast
+      - trading
+      - rag
+    restart: unless-stopped
+
+volumes:
+  trading_data:
+  training_data:

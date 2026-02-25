@@ -1,0 +1,27 @@
+# Environment
+.env
+env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database
+data/trading.db
+
+# Data files (keep training data)
+data/raw/
+data/processed/
+data/ercot/
