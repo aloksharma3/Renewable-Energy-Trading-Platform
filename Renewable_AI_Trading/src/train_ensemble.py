@@ -360,7 +360,9 @@ def main(days):
     for name, feats, y in targets:
         print(f"\n      --- {name} ({len(feats)} features) ---")
         X = df[feats]
-        X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
+        split_idx = int(len(X) * 0.8)
+        X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
         model = EnsembleForecaster(name, n_estimators=100)
         m = model.train(X_train, y_train, X_val, y_val)
         print(f"      MAPE: {m.get('ensemble_mape','N/A')}% | RMSE: {m.get('ensemble_rmse','N/A')} | MAE: {m.get('ensemble_mae','N/A')}")

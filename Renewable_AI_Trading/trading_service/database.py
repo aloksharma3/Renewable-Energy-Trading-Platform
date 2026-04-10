@@ -98,6 +98,20 @@ class Database:
                 last_updated TEXT
             )
         """)
+        
+        # Add this block inside _create_tables() after the positions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                price     REAL NOT NULL
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_price_history_timestamp
+            ON price_history (timestamp)
+        """)
 
         # Insert initial position if table is empty
         cursor.execute("SELECT COUNT(*) FROM positions")
@@ -298,3 +312,50 @@ class Database:
         conn.commit()
         conn.close()
         return {"message": "Database reset to initial state"}
+    
+    
+    def save_price(self, price: float):
+        """Persist a market price observation.
+        Automatically prunes to keep only the last 96 records (24 hours).
+        Called every pipeline cycle alongside update_price_history()."""
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "INSERT INTO price_history (timestamp, price) VALUES (?, ?)",
+                (datetime.utcnow().isoformat(), round(price, 4))
+            )
+            # Keep only last 96 records — delete older ones
+            conn.execute("""
+                DELETE FROM price_history
+                WHERE id NOT IN (
+                    SELECT id FROM price_history
+                    ORDER BY timestamp DESC
+                    LIMIT 96
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_recent_prices(self, limit: int = 96) -> list:
+        """
+        Load recent prices for threshold computation on startup.
+        Returns list of floats, oldest first — same order as recent_prices[].
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "SELECT price FROM price_history ORDER BY timestamp ASC LIMIT ?",
+                (limit,)
+            )
+            return [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def count_prices(self) -> int:
+        """Return number of stored price records."""
+        conn = self._get_connection()
+        try:
+            return conn.execute("SELECT COUNT(*) FROM price_history").fetchone()[0]
+        finally:
+            conn.close()

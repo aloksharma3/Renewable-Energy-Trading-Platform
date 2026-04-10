@@ -25,6 +25,7 @@ LAYOUT:
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from datetime import datetime
 import os
@@ -255,11 +256,19 @@ def check_service(url):
 
 
 # ═══════════════════════════════════════════════════════════
+#  BACKTEST ENGINE  (imported from backtest_engine.py)
+# ═══════════════════════════════════════════════════════════
+
+from backtest_engine import run_backtest
+
+
+# ═══════════════════════════════════════════════════════════
 #  FETCH ALL DATA
 # ═══════════════════════════════════════════════════════════
 
+
 portfolio = safe_get(f"{TRADING_URL}/portfolio", {})
-forecast_history = safe_get(f"{FORECAST_URL}/forecast/history?limit=96", [])
+forecast_history = safe_get(f"{FORECAST_URL}/forecast/history?limit=50", [])  # keep low for fast render
 trade_history = safe_get(f"{TRADING_URL}/trades?limit=100", [])
 weather = safe_get(f"{DATA_URL}/weather/latest")
 weather_hist = safe_get(f"{DATA_URL}/weather/history?limit=48", [])
@@ -370,50 +379,56 @@ st.markdown("")
 
 
 # ═══════════════════════════════════════════════════════════
-#  ROW 1 — KPI CARDS
+#  ROW 1 — KPI CARDS (5 primary + secondary row)
 # ═══════════════════════════════════════════════════════════
 
-k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
+# ── Primary KPIs — most important metrics ────────────────
+k1, k2, k3, k4, k5 = st.columns(5)
 
 with k1:
-    st.metric("POSITION", f"{portfolio.get('current_position_mwh', 0)} MWh")
-with k2:
     profit = portfolio.get("realized_profit", 0)
     st.metric("REALIZED P&L", f"${profit:,.2f}",
               delta=f"${profit:+,.2f}" if profit != 0 else None, delta_color="normal")
+with k2:
+    rt_price = ercot.get("price_usd_mwh") if ercot else None
+    freshness = f"updated {latest_forecast.get('timestamp', '—')[-8:-3]} CT" if latest_forecast.get('timestamp') else "awaiting data"
+    if rt_price and rt_price > 0:
+        st.metric("RT PRICE", f"${rt_price:.2f}", delta=freshness)
+    else:
+        st.metric("RT PRICE", "—", delta="awaiting ERCOT data")
 with k3:
+    pred_price = latest_forecast.get("price", {}).get("predicted")
+    if pred_price is not None:
+        delta_text = f"{'▲' if pred_price > (rt_price or 0) else '▼'} vs RT · signal {'+' if pred_price > (rt_price or 0) else ''}{(pred_price - (rt_price or 0)):.2f}"
+        st.metric("ML PREDICTED", f"${pred_price:.2f}", delta=delta_text)
+    else:
+        st.metric("ML PREDICTED", "—", delta="initializing")
+with k4:
+    win_rate = portfolio.get("win_rate", 0)
+    sells_count = portfolio.get("sell_count", 0)
     total = portfolio.get("total_trades", 0)
     buys = portfolio.get("buy_count", 0)
     sells = portfolio.get("sell_count", 0)
     holds = total - buys - sells
-    st.metric("TRADES", f"{total}", delta=f"{buys}B · {sells}S · {holds}H")
-with k4:
-    win_rate = portfolio.get("win_rate", 0)
-    sells_count = portfolio.get("sell_count", 0)
-    st.metric("WIN RATE", f"{win_rate}%" if sells_count > 0 else "—")
+    st.metric("WIN RATE", f"{win_rate}%" if sells_count > 0 else "—",
+              delta=f"{buys}B · {sells}S · {holds}H")
 with k5:
-    rt_price = ercot.get("price_usd_mwh") if ercot else None
-    if rt_price and rt_price > 0:
-        st.metric("RT PRICE", f"${rt_price:.2f}",
-                  delta="HB_NORTH · live")
-    else:
-        st.metric("RT PRICE", "—", delta="awaiting ERCOT data")
-with k6:
-    pred_price = latest_forecast.get("price", {}).get("predicted")
-    if pred_price is not None:
-        delta_text = f"{'▲' if pred_price > (rt_price or 0) else '▼'} vs RT"
-        st.metric("ML PREDICTED", f"${pred_price:.2f}", delta=delta_text)
-    else:
-        st.metric("ML PREDICTED", "—", delta="initializing")
-with k7:
+    st.metric("POSITION", f"{portfolio.get('current_position_mwh', 0)} MWh",
+              delta=f"avg cost ${portfolio.get('avg_cost', 0):.2f}/MWh" if portfolio.get('avg_cost') else None)
+
+# ── Secondary KPIs ────────────────────────────────────────
+st.markdown("<div style='margin-top:8px;'></div>", unsafe_allow_html=True)
+s1, s2, s3 = st.columns(3)
+
+with s1:
     pred_energy = latest_forecast.get("energy_output", {}).get("predicted")
     current_ghi = latest_forecast.get("weather", {}).get("irradiance", 0)
+    night_note  = " · nighttime" if current_ghi == 0 else f" · GHI {current_ghi} W/m²"
     if pred_energy is not None:
-        st.metric("ENERGY OUT", f"{pred_energy:.1f} MW",
-                  delta=f"GHI: {current_ghi} W/m²")
+        st.metric("SOLAR OUTPUT", f"{pred_energy:.1f} MW", delta=f"{'☀️' if current_ghi > 0 else '🌙'}{night_note}")
     else:
-        st.metric("ENERGY OUT", "—", delta="initializing")
-with k8:
+        st.metric("SOLAR OUTPUT", "—", delta="initializing")
+with s2:
     if spread and spread.get("spread") is not None:
         sp = spread["spread"]
         st.metric("RT-DAM SPREAD", f"${sp:+.2f}",
@@ -421,13 +436,27 @@ with k8:
                   delta_color="normal" if sp >= 0 else "inverse")
     else:
         st.metric("RT-DAM SPREAD", "N/A", delta="awaiting DAM data")
+with s3:
+    price_history_depth = len(recent_prices) if 'recent_prices' in dir() else 0
+    sell_thresh = portfolio.get("sell_threshold", "—")
+    buy_thresh  = portfolio.get("buy_threshold", "—")
+    st.metric("PIPELINE CYCLES", f"{len(forecast_history or [])}", delta="15-min intervals · DB persisted")
 
 
 # ═══════════════════════════════════════════════════════════
-#  ROW 2 — PRICE CHART
+#  TABS — Navigation
 # ═══════════════════════════════════════════════════════════
 
-st.markdown('<div class="section-header"><span class="icon">📈</span>Price Analysis — Predicted vs Actual vs Day-Ahead</div>', unsafe_allow_html=True)
+tab_market, tab_trading, tab_model = st.tabs([
+    "📈 Market & Forecasts",
+    "💰 Trading & Performance",
+    "🧪 Model Analytics",
+])
+
+with tab_market:
+
+    # ── PRICE CHART ──────────────────────────────────────────
+    st.markdown('<div class="section-header"><span class="icon">📈</span>Price Analysis — Predicted vs Actual vs Day-Ahead</div>', unsafe_allow_html=True)
 
 if forecast_history and len(forecast_history) > 1:
     timestamps, predicted_prices, actual_prices, dam_prices_series = [], [], [], []
@@ -584,30 +613,63 @@ with col_weather:
 with col_rag:
     st.markdown('<div class="section-header"><span class="icon">🧠</span>Market Intelligence (RAG)</div>', unsafe_allow_html=True)
 
-    rag = {}
-    if trade_history:
-        latest = trade_history[0]
-        rag_risk = latest.get("rag_risk_score")
-        rag_dir = latest.get("rag_direction")
+    # Build context-rich query using live market data so Gemini can give
+    # a meaningful risk score instead of a generic 0.50 default
+    _rt   = rt_price or (ercot.get("price_usd_mwh") if ercot else None)
+    _pred = pred_price or latest_forecast.get("price", {}).get("predicted")
+
+    if _rt and _pred:
+        rag_query = (
+            f"Current ERCOT conditions: "
+            f"RT price ${_rt:.2f}/MWh, "
+            f"ML forecast ${_pred:.2f}/MWh, "
+            f"Temperature {weather.get('temp', 'N/A')}°C, "
+            f"Wind {weather.get('wind_speed', 'N/A')} m/s, "
+            f"Cloud cover {weather.get('cloud_coverage', 'N/A')}%, "
+            f"Solar GHI {weather.get('irradiance', 0)} W/m², "
+            f"Time: {now_ct.strftime('%I:%M %p CT on %A')}. "
+            f"Based on these conditions and your energy market knowledge, "
+            f"what is the risk of an ERCOT HB_NORTH price spike in the next 2 hours?"
+        )
+    else:
+        rag_query = "What factors might affect ERCOT electricity prices?"
+
+    # Cache RAG call for 15 min — Streamlit reruns the entire script on every
+    # interaction so without caching this would burn Gemini quota on every click
+    @st.cache_data(ttl=900, show_spinner=False)
+    def fetch_rag(query: str, rag_url: str):
+        try:
+            r = requests.post(f"{rag_url}/analyze", json={"query": query}, timeout=35)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return None
+
+    rag = fetch_rag(rag_query, RAG_URL)
+
+    # Fallback to trade history if RAG service is down
+    if not rag and trade_history:
+        latest_t = trade_history[0]
+        rag_risk = latest_t.get("rag_risk_score")
+        rag_dir  = latest_t.get("rag_direction")
         if rag_risk is not None:
             rag = {
                 "risk_score": rag_risk,
                 "risk_level": "high" if rag_risk > 0.7 else ("medium" if rag_risk > 0.4 else "low"),
                 "price_direction": rag_dir or "stable",
+                "fallback": True,
             }
-
-    if not rag:
-        rag = safe_post(f"{RAG_URL}/analyze",
-                        {"query": "What factors might affect ERCOT electricity prices?"})
 
     if rag and not rag.get("fallback"):
         risk_score = rag.get("risk_score", 0.5)
         risk_level = rag.get("risk_level", "medium")
-        direction = rag.get("price_direction", "stable")
+        direction  = rag.get("price_direction", "stable")
 
-        risk_colors = {"low": "#10b981", "medium": "#f59e0b", "high": "#ef4444"}
+        risk_colors    = {"low": "#10b981", "medium": "#f59e0b", "high": "#ef4444"}
         direction_icons = {"up": "↗ RISING", "down": "↘ FALLING", "stable": "→ STABLE"}
 
+        # ── Risk + Direction cards ────────────────────────────
         r1, r2 = st.columns(2)
         with r1:
             clr = risk_colors.get(risk_level, "#f59e0b")
@@ -625,202 +687,485 @@ with col_rag:
                 <div class="sub">RAG-assessed outlook</div>
             </div>""", unsafe_allow_html=True)
 
+        # ── Key Market Signals ────────────────────────────────
         factors = rag.get("factors", [])
         if factors:
-            st.markdown("**Key Factors:**")
+            st.markdown("""
+            <div style="font-size:0.75rem; color:#64748b; text-transform:uppercase;
+                 letter-spacing:0.05em; margin:12px 0 6px 0;">
+                Key Market Signals
+            </div>""", unsafe_allow_html=True)
             for factor in factors[:5]:
-                st.markdown(f"<span style='color:#94a3b8; font-size:0.85rem;'>› {factor}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"<div style='color:#94a3b8; font-size:0.83rem; padding:5px 0;"
+                    f"border-bottom:1px solid #2a3040;'>› {factor}</div>",
+                    unsafe_allow_html=True
+                )
 
+        # ── Gemini Analysis Summary ───────────────────────────
         summary = rag.get("summary", "")
         if summary:
-            st.caption(summary[:300])
-    else:
-        st.markdown("""
-        <div class="info-card" style="text-align:center; padding:30px;">
-            <div style="font-size:0.85rem; color:#94a3b8;">RAG initializing — market intelligence loads on next pipeline cycle</div>
-        </div>""", unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-#  ROW 5 — LATEST TRADE + ERCOT MARKET
-# ═══════════════════════════════════════════════════════════
-
-col_trade, col_market = st.columns(2)
-
-with col_trade:
-    st.markdown('<div class="section-header"><span class="icon">🔄</span>Latest Trade</div>', unsafe_allow_html=True)
-    if trade_history:
-        latest = trade_history[0]
-        action = latest["action"]
-        badge = {"BUY": "badge-buy", "SELL": "badge-sell", "HOLD": "badge-hold"}.get(action, "badge-hold")
-
-        html = f'<div class="info-card"><div class="{badge}">{action}</div>'
-        if action != "HOLD":
-            pnl_clr = "#10b981" if latest["profit"] >= 0 else "#ef4444"
-            html += f"""
-            <div style="display:flex; gap:32px; margin-top:16px;">
-                <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">Price</div>
-                    <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:#f1f5f9;">${latest['price']:.2f}</div></div>
-                <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">Quantity</div>
-                    <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:#f1f5f9;">{latest['quantity']} MWh</div></div>
-                <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">P&L</div>
-                    <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:{pnl_clr};">${latest['profit']:+,.2f}</div></div>
-            </div>"""
-
-        reason = latest.get("reason", "N/A")
-        if len(reason) > 120:
-            reason = reason[:120] + "..."
-        html += f"""
-        <div style="margin-top:12px; font-size:0.8rem; color:#94a3b8;"><strong>Reason:</strong> {reason}</div>
-        <div style="margin-top:8px; font-size:0.75rem; color:#64748b;">
-            Position: {latest.get('position_after', 0)} MWh · {latest.get('timestamp', '')}</div></div>"""
-        st.markdown(html, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="info-card" style="text-align:center; padding:30px;">
-            <div style="font-size:0.85rem; color:#94a3b8;">First trade executes on next pipeline cycle</div>
-        </div>""", unsafe_allow_html=True)
-
-with col_market:
-    st.markdown('<div class="section-header"><span class="icon">💲</span>ERCOT Market Overview</div>', unsafe_allow_html=True)
-    m1, m2 = st.columns(2)
-    with m1:
-        rt = ercot.get("price_usd_mwh") if ercot else None
-        rt_display = f"${rt:.2f}" if rt and rt > 0 else "—"
-        rt_color = "#06b6d4" if rt and rt > 0 else "#64748b"
-        st.markdown(f"""
-        <div class="info-card">
-            <h4>Real-Time Price</h4>
-            <div class="value" style="color:{rt_color};">{rt_display}</div>
-            <div class="sub">HB_NORTH · 15-min intervals</div>
-        </div>""", unsafe_allow_html=True)
-    with m2:
-        if spread and spread.get("dam_price") is not None:
-            dp = spread["dam_price"]
-            sv = spread.get("spread", 0)
-            sc = "spread-positive" if sv > 0 else ("spread-negative" if sv < 0 else "spread-neutral")
             st.markdown(f"""
-            <div class="info-card">
-                <h4>Day-Ahead Price</h4>
-                <div class="value" style="color:#f59e0b;">${dp:.2f}</div>
-                <div class="sub {sc}">Spread: ${sv:+.2f}/MWh</div>
-            </div>""", unsafe_allow_html=True)
-        else:
-            st.markdown("""
-            <div class="info-card">
-                <h4>Day-Ahead Price</h4>
-                <div class="value">N/A</div>
-                <div class="sub">Fetch via sidebar controls</div>
-            </div>""", unsafe_allow_html=True)
-
-    # DAM hourly bar chart
-    if dam_today and dam_today.get("hours"):
-        hours = dam_today["hours"]
-        he = [f"HE{h.get('hour_ending', '')}" for h in hours]
-        dv = [h.get("dam_price_usd_mwh", 0) for h in hours]
-        fig_dam = go.Figure()
-        fig_dam.add_trace(go.Bar(
-            x=he, y=dv, marker_color=["#f59e0b" if v > 50 else "#2563eb" for v in dv],
-            marker_line=dict(width=0), name="DAM Price",
-        ))
-        fig_dam.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(26, 31, 46, 1)",
-            plot_bgcolor="rgba(26, 31, 46, 1)",
-            font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
-            height=170, yaxis_title="$/MWh",
-            margin=dict(l=8, r=8, t=8, b=8), showlegend=False,
-            xaxis=dict(gridcolor="rgba(42,48,64,0.5)"),
-            yaxis=dict(gridcolor="rgba(42,48,64,0.5)"),
-        )
-        st.plotly_chart(fig_dam, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════
-#  ROW 6 — TRADE HISTORY
-# ═══════════════════════════════════════════════════════════
-
-st.markdown('<div class="section-header"><span class="icon">📋</span>Trade History</div>', unsafe_allow_html=True)
-
-if trade_history:
-    df = pd.DataFrame(trade_history)
-    cols = ["timestamp", "action", "price", "quantity", "profit", "position_after", "rag_risk_score", "reason"]
-    available = [c for c in cols if c in df.columns]
-    df_d = df[available].copy()
-    rename = {"timestamp": "Time", "action": "Action", "price": "Price ($/MWh)",
-              "quantity": "Qty (MWh)", "profit": "P&L ($)", "position_after": "Position",
-              "rag_risk_score": "RAG Risk", "reason": "Reason"}
-    df_d.rename(columns={k: v for k, v in rename.items() if k in df_d.columns}, inplace=True)
-    if "Price ($/MWh)" in df_d.columns:
-        df_d["Price ($/MWh)"] = df_d["Price ($/MWh)"].apply(lambda x: f"${x:.2f}" if pd.notna(x) and x != 0 else "—")
-    if "P&L ($)" in df_d.columns:
-        df_d["P&L ($)"] = df_d["P&L ($)"].apply(lambda x: f"${x:+,.2f}" if pd.notna(x) else "—")
-    st.dataframe(df_d, use_container_width=True, height=320, hide_index=True)
-else:
-    st.markdown('<div class="info-card" style="text-align:center; padding:24px;"><div style="color:#64748b; font-size:0.8rem;">Trade history populates as the automated pipeline executes</div></div>', unsafe_allow_html=True)
-
-
-# ═══════════════════════════════════════════════════════════
-#  ROW 7 — CUMULATIVE P&L
-# ═══════════════════════════════════════════════════════════
-
-st.markdown('<div class="section-header"><span class="icon">💰</span>Cumulative P&L</div>', unsafe_allow_html=True)
-
-if trade_history:
-    trades_chrono = list(reversed(trade_history))
-    cumulative, running, times = [], 0, []
-    for t in trades_chrono:
-        running += t.get("profit", 0)
-        cumulative.append(running)
-        times.append(t["timestamp"])
-
-    fill_c = "rgba(16,185,129,0.08)" if running >= 0 else "rgba(239,68,68,0.08)"
-    line_c = "#10b981" if running >= 0 else "#ef4444"
-
-    fig_pnl = go.Figure()
-    fig_pnl.add_trace(go.Scatter(
-        x=times, y=cumulative, mode="lines", fill="tozeroy",
-        fillcolor=fill_c, line=dict(color=line_c, width=2.5), name="Cumulative P&L",
-    ))
-    fig_pnl.add_hline(y=0, line_dash="dot", line_color="#64748b", line_width=1)
-    fig_pnl.update_layout(**PLOTLY_LAYOUT, height=280, yaxis_title="Profit ($)")
-    st.plotly_chart(fig_pnl, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════
-#  ROW 8 — MODEL PERFORMANCE + FEATURE IMPORTANCE
-# ═══════════════════════════════════════════════════════════
-
-st.markdown('<div class="section-header"><span class="icon">🧪</span>Model Performance</div>', unsafe_allow_html=True)
-
-if metrics:
-    col_e, col_p, col_d = st.columns(3)
-    for col, key, label, color in [
-        (col_e, "energy_output", "Energy Output", "#f59e0b"),
-        (col_p, "price", "Price Forecast", "#3b82f6"),
-        (col_d, "demand", "Grid Demand", "#8b5cf6"),
-    ]:
-        with col:
-            m = metrics.get(key, {})
-            st.markdown(f"""
-            <div class="info-card">
-                <h4 style="color:{color};">{label}</h4>
-                <div class="value">{m.get('ensemble_mape', 'N/A')}%</div>
-                <div class="sub">Ensemble MAPE</div>
-                <div style="margin-top:12px; font-size:0.75rem; color:#64748b;">
-                    RF: {m.get('rf_mape', 'N/A')}% · XGB: {m.get('xgb_mape', 'N/A')}%<br/>
-                    Naive: {m.get('naive_mape', 'N/A')}% · Improvement: {m.get('improvement_over_naive_pct', 'N/A')}%
+            <div style="margin-top:12px; background:rgba(59,130,246,0.05);
+                 border-left:3px solid #3b82f6; padding:10px 14px;
+                 border-radius:0 8px 8px 0;">
+                <div style="font-size:0.72rem; color:#64748b; text-transform:uppercase;
+                     letter-spacing:0.04em; margin-bottom:6px;">
+                    Gemini Analysis
+                </div>
+                <div style="font-size:0.82rem; color:#94a3b8; line-height:1.6;">
+                    {summary[:400]}
                 </div>
             </div>""", unsafe_allow_html=True)
+
+        # ── Source Documents ──────────────────────────────────
+        sources = rag.get("sources", [])
+        if sources:
+            with st.expander(f"📰 {len(sources)} source documents"):
+                for s in sources[:3]:
+                    meta = s.get("metadata", {})
+                    src  = meta.get("source", "Knowledge Base")
+                    st.markdown(
+                        f"<div style='font-size:0.72rem; color:#3b82f6; margin-bottom:2px;'>"
+                        f"{src}</div>"
+                        f"<div style='font-size:0.8rem; color:#94a3b8; margin-bottom:12px;'>"
+                        f"{s['content'][:200]}...</div>",
+                        unsafe_allow_html=True
+                    )
+    else:
+        st.markdown("""
+        <div class="info-card" style="text-align:center; padding:30px;">
+            <div style="font-size:0.85rem; color:#94a3b8;">
+                RAG initializing — market intelligence loads on next pipeline cycle
+            </div>
+        </div>""", unsafe_allow_html=True)
+
+
+with tab_trading:
+
+    # ── CUMULATIVE P&L — shown first (most important visual) ─
+    st.markdown('<div class="section-header"><span class="icon">💰</span>Cumulative P&L</div>', unsafe_allow_html=True)
+
+    if trade_history:
+        trades_chrono = list(reversed(trade_history))
+        cumulative, running, times = [], 0, []
+        for t in trades_chrono:
+            running += t.get("profit", 0)
+            cumulative.append(running)
+            times.append(t["timestamp"])
+
+        fill_c = "rgba(16,185,129,0.08)" if running >= 0 else "rgba(239,68,68,0.08)"
+        line_c = "#10b981" if running >= 0 else "#ef4444"
+
+        fig_pnl = go.Figure()
+        fig_pnl.add_trace(go.Scatter(
+            x=times, y=cumulative, mode="lines", fill="tozeroy",
+            fillcolor=fill_c, line=dict(color=line_c, width=2.5), name="Cumulative P&L",
+        ))
+        fig_pnl.add_hline(y=0, line_dash="dot", line_color="#64748b", line_width=1)
+        fig_pnl.update_layout(**PLOTLY_LAYOUT, height=280, yaxis_title="Profit ($)")
+        st.plotly_chart(fig_pnl, use_container_width=True)
+    else:
+        st.markdown('<div class="info-card" style="text-align:center; padding:24px;"><div style="color:#64748b; font-size:0.8rem;">P&L chart populates as trades execute</div></div>', unsafe_allow_html=True)
+
+    # ── LATEST TRADE + ERCOT MARKET ──────────────────────────
+    col_trade, col_market = st.columns(2)
+
+    with col_trade:
+        st.markdown('<div class="section-header"><span class="icon">🔄</span>Latest Trade</div>', unsafe_allow_html=True)
+        if trade_history:
+            latest = trade_history[0]
+            action = latest["action"]
+            badge = {"BUY": "badge-buy", "SELL": "badge-sell", "HOLD": "badge-hold"}.get(action, "badge-hold")
+
+            html = f'<div class="info-card"><div class="{badge}">{action}</div>'
+            if action != "HOLD":
+                pnl_clr = "#10b981" if latest["profit"] >= 0 else "#ef4444"
+                html += f"""
+                <div style="display:flex; gap:32px; margin-top:16px;">
+                    <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">Price</div>
+                        <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:#f1f5f9;">${latest['price']:.2f}</div></div>
+                    <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">Quantity</div>
+                        <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:#f1f5f9;">{latest['quantity']} MWh</div></div>
+                    <div><div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;">P&L</div>
+                        <div style="font-family:'JetBrains Mono',monospace; font-size:1.2rem; color:{pnl_clr};">${latest['profit']:+,.2f}</div></div>
+                </div>"""
+
+            reason = latest.get("reason", "N/A")
+            reason_parts = [p.strip() for p in reason.split("|")]
+            reason_html  = "<br/>".join(f"› {p}" for p in reason_parts[:6])
+            html += f"""
+            <div style="margin-top:12px;">
+                <div style="font-size:0.7rem; color:#64748b; text-transform:uppercase;
+                     letter-spacing:0.04em; margin-bottom:6px;">Signal Reasoning</div>
+                <div style="font-size:0.78rem; color:#94a3b8; line-height:1.8;">
+                    {reason_html}
+                </div>
+            </div>
+            <div style="margin-top:8px; font-size:0.75rem; color:#64748b;">
+                Position: {latest.get('position_after', 0)} MWh · {latest.get('timestamp', '')}</div></div>"""
+            st.markdown(html, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="info-card" style="text-align:center; padding:30px;">
+                <div style="font-size:0.85rem; color:#94a3b8;">First trade executes on next pipeline cycle</div>
+            </div>""", unsafe_allow_html=True)
+
+    with col_market:
+        st.markdown('<div class="section-header"><span class="icon">💲</span>ERCOT Market Overview</div>', unsafe_allow_html=True)
+        m1, m2 = st.columns(2)
+        with m1:
+            rt = ercot.get("price_usd_mwh") if ercot else None
+            rt_display = f"${rt:.2f}" if rt and rt > 0 else "—"
+            rt_color = "#06b6d4" if rt and rt > 0 else "#64748b"
+            st.markdown(f"""
+            <div class="info-card">
+                <h4>Real-Time Price</h4>
+                <div class="value" style="color:{rt_color};">{rt_display}</div>
+                <div class="sub">HB_NORTH · 15-min intervals</div>
+            </div>""", unsafe_allow_html=True)
+        with m2:
+            if spread and spread.get("dam_price") is not None:
+                dp = spread["dam_price"]
+                sv = spread.get("spread", 0)
+                sc = "spread-positive" if sv > 0 else ("spread-negative" if sv < 0 else "spread-neutral")
+                st.markdown(f"""
+                <div class="info-card">
+                    <h4>Day-Ahead Price</h4>
+                    <div class="value" style="color:#f59e0b;">${dp:.2f}</div>
+                    <div class="sub {sc}">Spread: ${sv:+.2f}/MWh</div>
+                </div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("""
+                <div class="info-card">
+                    <h4>Day-Ahead Price</h4>
+                    <div class="value">N/A</div>
+                    <div class="sub">Fetch via sidebar controls</div>
+                </div>""", unsafe_allow_html=True)
+
+        if dam_today and dam_today.get("hours"):
+            hours = dam_today["hours"]
+            he = [f"HE{h.get('hour_ending', '')}" for h in hours]
+            dv = [h.get("dam_price_usd_mwh", 0) for h in hours]
+            fig_dam2 = go.Figure()
+            fig_dam2.add_trace(go.Bar(
+                x=he, y=dv, marker_color=["#f59e0b" if v > 50 else "#2563eb" for v in dv],
+                marker_line=dict(width=0), name="DAM Price",
+            ))
+            fig_dam2.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="rgba(26, 31, 46, 1)",
+                plot_bgcolor="rgba(26, 31, 46, 1)",
+                font=dict(family="DM Sans, sans-serif", color="#94a3b8", size=11),
+                height=170, yaxis_title="$/MWh",
+                margin=dict(l=8, r=8, t=8, b=8), showlegend=False,
+                xaxis=dict(gridcolor="rgba(42,48,64,0.5)"),
+                yaxis=dict(gridcolor="rgba(42,48,64,0.5)"),
+            )
+            st.plotly_chart(fig_dam2, use_container_width=True)
+
+    # ── TRADE HISTORY with color-coded action badges ──────────
+    st.markdown('<div class="section-header"><span class="icon">📋</span>Trade History</div>', unsafe_allow_html=True)
+
+    if trade_history:
+        df = pd.DataFrame(trade_history)
+        cols = ["timestamp", "action", "price", "quantity", "profit", "position_after", "rag_risk_score"]
+        available = [c for c in cols if c in df.columns]
+        df_d = df[available].copy()
+        rename = {"timestamp": "Time", "action": "Action", "price": "Price ($/MWh)",
+                  "quantity": "Qty (MWh)", "profit": "P&L ($)", "position_after": "Position",
+                  "rag_risk_score": "RAG Risk"}
+        df_d.rename(columns={k: v for k, v in rename.items() if k in df_d.columns}, inplace=True)
+        if "Price ($/MWh)" in df_d.columns:
+            df_d["Price ($/MWh)"] = df_d["Price ($/MWh)"].apply(lambda x: f"${x:.2f}" if pd.notna(x) and x != 0 else "—")
+        if "P&L ($)" in df_d.columns:
+            df_d["P&L ($)"] = df_d["P&L ($)"].apply(lambda x: f"${x:+,.2f}" if pd.notna(x) else "—")
+        # Color code Action column
+        if "Action" in df_d.columns:
+            df_d["Action"] = df_d["Action"].apply(
+                lambda x: f"🟢 {x}" if x == "BUY" else (f"🔴 {x}" if x == "SELL" else f"🟡 {x}")
+            )
+        st.dataframe(df_d, use_container_width=True, height=320, hide_index=True)
+    else:
+        st.markdown('<div class="info-card" style="text-align:center; padding:24px;"><div style="color:#64748b; font-size:0.8rem;">Trade history populates as the automated pipeline executes. Click ▶ Run Full Pipeline in the sidebar to start.</div></div>', unsafe_allow_html=True)
+
+    # ── BACKTESTING ───────────────────────────────────────────
+    st.markdown('<div class="section-header"><span class="icon">📊</span>Backtesting — ML Strategy vs Baselines</div>', unsafe_allow_html=True)
+
+    @st.cache_data(ttl=900)
+    def load_backtest_history():
+        return safe_get(f"{FORECAST_URL}/forecast/history?limit=2880", [])
+
+    bt_history = load_backtest_history()
+    bt = run_backtest(bt_history or forecast_history)
+
+if bt:
+    s = bt["stats"]
+
+    # ── KPI Row ──────────────────────────────────────────────
+    bk1, bk2, bk3, bk4, bk5, bk6 = st.columns(6)
+
+    with bk1:
+        st.metric("BACKTEST PERIOD", s["period"], delta=f"{s['n_intervals']} intervals")
+    with bk2:
+        st.metric("TOTAL TRADES", str(s["total_trades"]), delta="ML strategy")
+    with bk3:
+        wr_delta = "above random" if s["win_rate"] > 50 else "below 50%"
+        st.metric("WIN RATE", f"{s['win_rate']}%", delta=wr_delta,
+                  delta_color="normal" if s["win_rate"] > 50 else "inverse")
+    with bk4:
+        if s["sharpe"] is not None:
+            sh_delta = "good" if s["sharpe"] >= 1.0 else ("neutral" if s["sharpe"] >= 0 else "negative")
+            st.metric("SHARPE RATIO", f"{s['sharpe']}", delta=sh_delta,
+                      delta_color="normal" if s["sharpe"] >= 1.0 else "off")
+        else:
+            st.metric("SHARPE RATIO", "—", delta=f"needs 96+ intervals · have {s['n_intervals']}")
+    with bk5:
+        st.metric("MAX DRAWDOWN", f"${s['max_drawdown']:,.0f}",
+                  delta="peak-to-trough", delta_color="off")
+    with bk6:
+        vs_bh = s["total_pnl"] - s["bh_pnl"]
+        st.metric("ML vs BUY-HOLD", f"${vs_bh:+,.0f}",
+                  delta="alpha generated", delta_color="normal" if vs_bh >= 0 else "inverse")
+
+    st.markdown("")
+
+    # ── Equity Curves ────────────────────────────────────────
+    col_chart, col_summary = st.columns([3, 1])
+
+    with col_chart:
+        fig_bt = go.Figure()
+
+        fig_bt.add_trace(go.Scatter(
+            x=bt["times"], y=bt["ml_equity"],
+            mode="lines", name="ML Strategy",
+            line=dict(color="#3b82f6", width=2.5),
+            fill="tozeroy", fillcolor="rgba(59,130,246,0.06)",
+        ))
+        fig_bt.add_trace(go.Scatter(
+            x=bt["times"], y=bt["bh_equity"],
+            mode="lines", name="Buy & Hold",
+            line=dict(color="#f59e0b", width=1.8, dash="dash"),
+        ))
+        fig_bt.add_trace(go.Scatter(
+            x=bt["times"], y=bt["nr_equity"],
+            mode="lines", name="Naive Mean-Reversion",
+            line=dict(color="#8b5cf6", width=1.5, dash="dot"),
+        ))
+        fig_bt.add_hline(y=0, line_dash="dot", line_color="#64748b", line_width=1)
+
+        # Mark trade entries/exits
+        if bt["trades_log"]:
+            sell_times = [t["time"] for t in bt["trades_log"]]
+            sell_pnls  = []
+            running    = 0.0
+            pnl_map    = {t["time"]: t["pnl"] for t in bt["trades_log"]}
+            for ts in bt["times"]:
+                if ts in pnl_map:
+                    running += pnl_map[ts]
+                sell_pnls.append(running if ts in pnl_map else None)
+
+            win_times  = [t["time"] for t in bt["trades_log"] if t["win"]]
+            win_vals   = []
+            running2   = 0.0
+            for t in bt["trades_log"]:
+                running2 += t["pnl"]
+                if t["win"]:
+                    win_vals.append(running2)
+
+            loss_times = [t["time"] for t in bt["trades_log"] if not t["win"]]
+            loss_vals  = []
+            running3   = 0.0
+            for t in bt["trades_log"]:
+                running3 += t["pnl"]
+                if not t["win"]:
+                    loss_vals.append(running3)
+
+            if win_times:
+                fig_bt.add_trace(go.Scatter(
+                    x=win_times, y=win_vals, mode="markers", name="Winning Trade",
+                    marker=dict(symbol="triangle-up", size=10, color="#10b981",
+                                line=dict(width=1, color="#0a0e17")),
+                ))
+            if loss_times:
+                fig_bt.add_trace(go.Scatter(
+                    x=loss_times, y=loss_vals, mode="markers", name="Losing Trade",
+                    marker=dict(symbol="triangle-down", size=10, color="#ef4444",
+                                line=dict(width=1, color="#0a0e17")),
+                ))
+
+        fig_bt.update_layout(
+            **PLOTLY_LAYOUT, height=380,
+            yaxis_title="Cumulative P&L ($)",
+            title=dict(text="Cumulative Returns: ML Strategy vs Baselines",
+                       font=dict(size=13, color="#94a3b8"), x=0),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_bt, use_container_width=True)
+
+    with col_summary:
+        # Strategy comparison table
+        ml_pnl = s["total_pnl"]
+        bh_pnl = s["bh_pnl"]
+        nr_pnl = s["nr_pnl"]
+        best   = max(ml_pnl, bh_pnl, nr_pnl)
+
+        def pnl_color(v):
+            return "#10b981" if v >= 0 else "#ef4444"
+
+        def crown(v):
+            return " 👑" if v == best else ""
+
+        sharpe_color  = "#10b981" if s["sharpe"] and s["sharpe"] >= 1 else "#f59e0b"
+        sharpe_display = s["sharpe"] if s["sharpe"] is not None else "— (need 96+ intervals)"
+
+        st.markdown(f"""
+        <div class="info-card" style="margin-top:0;">
+            <h4>Strategy Comparison</h4>
+            <div style="font-size:0.75rem; color:#64748b; margin-bottom:12px;">
+                Period: {s['period']}
+            </div>
+
+            <div style="margin-bottom:14px;">
+                <div style="font-size:0.72rem; color:#3b82f6; font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">
+                    ML Strategy{crown(ml_pnl)}
+                </div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:1.1rem; color:{pnl_color(ml_pnl)};">
+                    ${ml_pnl:+,.0f}
+                </div>
+                <div style="font-size:0.72rem; color:#64748b;">
+                    {s['total_trades']} trades · {s['win_rate']}% win
+                </div>
+            </div>
+
+            <div style="margin-bottom:14px;">
+                <div style="font-size:0.72rem; color:#f59e0b; font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">
+                    Buy &amp; Hold{crown(bh_pnl)}
+                </div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:1.1rem; color:{pnl_color(bh_pnl)};">
+                    ${bh_pnl:+,.0f}
+                </div>
+                <div style="font-size:0.72rem; color:#64748b;">passive · no rebalancing</div>
+            </div>
+
+            <div style="margin-bottom:14px;">
+                <div style="font-size:0.72rem; color:#8b5cf6; font-weight:600; text-transform:uppercase; letter-spacing:0.04em;">
+                    Naive Mean-Rev{crown(nr_pnl)}
+                </div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:1.1rem; color:{pnl_color(nr_pnl)};">
+                    ${nr_pnl:+,.0f}
+                </div>
+                <div style="font-size:0.72rem; color:#64748b;">no ML · rule-based</div>
+            </div>
+
+            <div style="border-top:1px solid #2a3040; padding-top:12px; margin-top:4px;">
+                <div style="font-size:0.72rem; color:#64748b;">Sharpe Ratio</div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:1rem; color:{sharpe_color};">
+                    {sharpe_display}
+                </div>
+                <div style="font-size:0.72rem; color:#64748b; margin-top:6px;">Max Drawdown</div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:1rem; color:#ef4444;">
+                    ${s['max_drawdown']:,.0f}
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Per-Trade Log ─────────────────────────────────────────
+    if bt["trades_log"]:
+        with st.expander(f"📋 Trade Log — {len(bt['trades_log'])} backtest trades"):
+            df_log = pd.DataFrame(bt["trades_log"])
+            df_log["pnl"]    = df_log["pnl"].apply(lambda x: f"${x:+,.2f}")
+            df_log["win"]    = df_log["win"].apply(lambda x: "✅ Win" if x else "❌ Loss")
+            df_log.columns   = ["Time", "Buy Price", "Sell Price", "Signal Entry", "Signal Exit", "P&L", "Result"]
+            st.dataframe(df_log, use_container_width=True, hide_index=True, height=260)
+
+    st.caption(
+        "Backtest runs ML signal logic on historical forecast data. "
+        "Signal = ML Predicted − Actual Market Price. "
+        "Dynamic threshold = 35th percentile of recent |signals| (min $1.50). "
+        "Trade size: 50 MWh. No transaction costs applied."
+    )
+
 else:
-    st.info("Model metrics not available — run training first.")
+    st.markdown("""
+    <div class="info-card" style="text-align:center; padding:32px;">
+        <div style="font-size:1.5rem; margin-bottom:8px;">📊</div>
+        <div style="font-size:0.9rem; color:#94a3b8;">
+            Backtest available after the pipeline collects at least 20 forecast intervals
+        </div>
+        <div style="font-size:0.78rem; color:#64748b; margin-top:6px;">
+            Each 15-minute pipeline cycle adds one interval · Run pipeline from the sidebar to populate
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Feature Importance — All Models
-st.markdown('<div class="section-header"><span class="icon">🔍</span>Feature Importance</div>', unsafe_allow_html=True)
 
-if importance:
-    # Clean feature name mapping
-    label_map = {
+with tab_model:
+
+    # ── MODEL PERFORMANCE with train/test period ──────────────
+    st.markdown('<div class="section-header"><span class="icon">🧪</span>Model Performance</div>', unsafe_allow_html=True)
+
+    if metrics:
+        # Show train/test split info
+        # train_samples/val_samples only available after retraining via API
+        # Fall back to showing training CSV row count
+        price_m = metrics.get("price", {})
+        train_samples = price_m.get("train_samples")
+        val_samples   = price_m.get("val_samples")
+        if train_samples and val_samples:
+            split_info = f"Train: {train_samples:,} samples · Val: {val_samples:,} samples"
+        else:
+            split_info = "80% of ERCOT + weather data for training · 20% held out for validation"
+        st.markdown(f"""
+        <div style="font-size:0.78rem; color:#64748b; margin-bottom:12px; padding:8px 12px;
+             background:rgba(59,130,246,0.05); border-radius:8px; border-left:3px solid #3b82f6;">
+            <strong style="color:#94a3b8;">Validation methodology:</strong>
+            Chronological 80/20 split — trained on first 80% of data, validated on last 20%.
+            No data leakage: model never saw validation prices during training.
+            {split_info}
+        </div>""", unsafe_allow_html=True)
+
+        col_e, col_p, col_d = st.columns(3)
+        for col, key, label, color in [
+            (col_e, "energy_output", "Energy Output", "#f59e0b"),
+            (col_p, "price", "Price Forecast", "#3b82f6"),
+            (col_d, "demand", "Grid Demand", "#8b5cf6"),
+        ]:
+            with col:
+                m = metrics.get(key, {})
+                improvement = m.get('improvement_over_naive_pct', 0)
+                imp_color = "#10b981" if improvement and float(str(improvement).replace('%','') or 0) > 20 else "#f59e0b"
+                st.markdown(f"""
+                <div class="info-card">
+                    <h4 style="color:{color};">{label}</h4>
+                    <div class="value">{m.get('ensemble_mape', 'N/A')}%</div>
+                    <div class="sub">Ensemble MAPE · lower is better</div>
+                    <div style="margin-top:12px; font-size:0.75rem; color:#64748b;">
+                        RF: {m.get('rf_mape', 'N/A')}% · XGB: {m.get('xgb_mape', 'N/A')}%<br/>
+                        Naive baseline: {m.get('naive_mape', 'N/A')}%
+                    </div>
+                    <div style="margin-top:8px; font-size:0.78rem; color:{imp_color}; font-weight:600;">
+                        ↑ {m.get('improvement_over_naive_pct', 'N/A')}% better than naive
+                    </div>
+                </div>""", unsafe_allow_html=True)
+    else:
+        st.info("Model metrics not available — run training first.")
+
+    # ── FEATURE IMPORTANCE with interpretive context ──────────
+    st.markdown('<div class="section-header"><span class="icon">🔍</span>Feature Importance</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div style="font-size:0.78rem; color:#64748b; margin-bottom:12px; padding:8px 12px;
+         background:rgba(139,92,246,0.05); border-radius:8px; border-left:3px solid #8b5cf6;">
+        <strong style="color:#94a3b8;">How to read this:</strong>
+        Higher % = the model relies more on that feature to make predictions.
+        Price model dominated by recent price lags means it uses momentum patterns.
+        Energy model dominated by wind speed means weather is the key driver.
+    </div>""", unsafe_allow_html=True)
+
+    if importance:
+        # Clean feature name mapping
+        label_map = {
         "price_lag_1h": "Price (1h ago)", "price_lag_2h": "Price (2h ago)",
         "price_lag_3h": "Price (3h ago)", "price_lag_24h": "Price (24h ago)",
         "price_lag_168h": "Price (1 week ago)", "price_diff_1h": "Price Δ (1h)",

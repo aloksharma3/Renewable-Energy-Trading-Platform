@@ -1,0 +1,40 @@
+# ============================================================
+# GitHub Actions: Deploy to Hugging Face Spaces
+# ============================================================
+# On every push to main, syncs the repo to your HF Space.
+# HF then builds the Dockerfile and deploys automatically.
+#
+# REQUIRED GITHUB SECRETS:
+#   HF_TOKEN  — Hugging Face write access token
+#              (generate at https://huggingface.co/settings/tokens)
+#
+# REQUIRED HF SPACE SECRETS (set in Space Settings > Variables):
+#   ERCOT_SUBSCRIPTION_KEY
+#   ERCOT_USERNAME
+#   ERCOT_PASSWORD
+#   GEMINI_API_KEY
+# ============================================================
+
+name: Deploy to Hugging Face Spaces
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:    # allows manual trigger from Actions tab
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git remote add hf https://aloksharma28:$HF_TOKEN@huggingface.co/spaces/aloksharma28/energy-trading-platform || true
+          git push hf main --force

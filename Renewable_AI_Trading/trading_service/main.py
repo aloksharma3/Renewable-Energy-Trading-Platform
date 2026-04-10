@@ -71,7 +71,9 @@ FALLBACK_BUY = float(os.getenv("BUY_THRESHOLD", "25"))        # fallback if no h
 db = Database(DB_PATH)
 
 # ─── Price History for Dynamic Thresholds ───────────────────
-recent_prices = []  # rolling window of recent market prices
+# Seeded from DB on startup so thresholds survive container restarts
+recent_prices = db.get_recent_prices()
+logger.info(f"Seeded {len(recent_prices)} prices from DB for threshold computation")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -81,12 +83,14 @@ recent_prices = []  # rolling window of recent market prices
 def update_price_history(price):
     """
     Track recent market prices for dynamic threshold computation.
-    Keeps a rolling window of the last 96 prices (~24 hours at 15-min intervals).
+    Keeps rolling window of last 96 prices in memory AND persists to DB
+    so thresholds survive container restarts.
     """
     if price is not None and price > 0:
         recent_prices.append(float(price))
         while len(recent_prices) > 96:
             recent_prices.pop(0)
+        db.save_price(float(price))
 
 
 def compute_dynamic_thresholds():
@@ -150,9 +154,11 @@ def get_forecast():
         return None
 
 
-def get_rag_assessment():
+def get_rag_assessment(forecast=None):
     """
     Get market risk assessment from RAG service.
+    Passes live forecast data in the query so Gemini can give
+    a meaningful risk score grounded in current conditions.
 
     Returns:
         {
@@ -163,10 +169,30 @@ def get_rag_assessment():
             "summary": "Multiple indicators suggest..."
         }
     """
+    # Build context-rich query if we have live data
+    if forecast:
+        actual_price  = forecast.get("actual_market_price")
+        predicted     = forecast.get("price", {}).get("predicted")
+        weather       = forecast.get("weather", {})
+        from datetime import timezone
+        now_str = datetime.now(timezone.utc).strftime("%I:%M %p UTC on %A")
+        query = (
+            f"Current ERCOT conditions: "
+            f"RT price ${actual_price:.2f}/MWh, "
+            f"ML forecast ${predicted:.2f}/MWh, "
+            f"Temperature {weather.get('temp', 'N/A')}°C, "
+            f"Wind {weather.get('wind_speed', 'N/A')} m/s, "
+            f"Time: {now_str}. "
+            f"What is the risk of an ERCOT HB_NORTH price spike in the next 2 hours?"
+        ) if actual_price and predicted else \
+            "What factors might affect ERCOT HB_NORTH electricity prices in the next few hours?"
+    else:
+        query = "What factors might affect ERCOT HB_NORTH electricity prices in the next few hours?"
+
     try:
         response = requests.post(
             f"{RAG_SERVICE_URL}/analyze",
-            json={"query": "What factors might affect ERCOT HB_NORTH electricity prices in the next few hours?"},
+            json={"query": query},
             timeout=30,
         )
         response.raise_for_status()
@@ -361,22 +387,44 @@ def execute_trade():
     if predicted_price <= 0:
         return {"action": "HOLD", "reason": "Invalid price prediction"}
 
-    # Step 2: Get RAG assessment
-    rag = get_rag_assessment()
+    # Step 2: Get RAG assessment — pass forecast so query includes live conditions
+    rag = get_rag_assessment(forecast)
 
     # Step 3: Compute dynamic thresholds (percentile-based + RAG adjustment)
     sell_threshold, buy_threshold = adjust_thresholds(rag)
 
+    # Signal transparency — show the ML math behind every decision
+    signal = round(predicted_price - (actual_price or predicted_price), 2)
+    conf_width = round((confidence_upper - confidence_lower), 2) if confidence_lower and confidence_upper else None
+    conf_str = f"CI [{confidence_lower:.2f}, {confidence_upper:.2f}] width=${conf_width:.2f}" if conf_width else "CI unavailable"
+
+    # Safe display of actual_price which can be None
+    actual_price_str = f"${actual_price:.2f}" if actual_price is not None else "N/A"
+
     # Step 4: Determine action
     if predicted_price >= sell_threshold:
         action = "SELL"
-        reason = f"Price ${predicted_price} >= sell threshold ${sell_threshold}"
+        reason = (
+            f"ML Signal: forecast ${predicted_price:.2f} >= sell threshold ${sell_threshold:.2f} | "
+            f"Market {actual_price_str} | Signal +${signal:.2f} | {conf_str} | "
+            f"Thresholds: buy=${buy_threshold:.2f} sell=${sell_threshold:.2f} "
+            f"(dynamic {BUY_PERCENTILE}th/{SELL_PERCENTILE}th pct, {len(recent_prices)} prices)"
+        )
     elif predicted_price <= buy_threshold:
         action = "BUY"
-        reason = f"Price ${predicted_price} <= buy threshold ${buy_threshold}"
+        reason = (
+            f"ML Signal: forecast ${predicted_price:.2f} <= buy threshold ${buy_threshold:.2f} | "
+            f"Market {actual_price_str} | Signal ${signal:.2f} | {conf_str} | "
+            f"Thresholds: buy=${buy_threshold:.2f} sell=${sell_threshold:.2f} "
+            f"(dynamic {BUY_PERCENTILE}th/{SELL_PERCENTILE}th pct, {len(recent_prices)} prices)"
+        )
     else:
         action = "HOLD"
-        reason = f"Price ${predicted_price} between buy ${buy_threshold} and sell ${sell_threshold}"
+        reason = (
+            f"ML Signal: forecast ${predicted_price:.2f} between thresholds | "
+            f"Market {actual_price_str} | Signal ${signal:.2f} | {conf_str} | "
+            f"Need forecast < ${buy_threshold:.2f} to BUY or > ${sell_threshold:.2f} to SELL"
+        )
 
     # Add RAG context to reason
     if rag.get("risk_score", 0.5) > 0.6:

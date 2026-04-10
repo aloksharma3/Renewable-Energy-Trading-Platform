@@ -9,6 +9,12 @@
 #   4. trading         → calls forecast + rag, manages trades in SQLite
 #   5. dashboard       → calls all services, displays everything
 #   6. scheduler       → triggers pipeline every 15 minutes
+#
+# VOLUMES (all bind mounts — files visible directly in your project folder)
+#   ./data/training/   → training_data.csv, collected_data.csv  (data_service + forecast)
+#   ./data/trading/    → trading.db                              (trading_service)
+#   ./data/forecast/   → forecast.db                             (forecast_service)
+#   ./models/          → *.joblib model files                    (forecast_service)
 
 services:
 
@@ -20,7 +26,7 @@ services:
       - 8.8.8.8
       - 8.8.4.4
     volumes:
-      - training_data:/app/data
+      - ./data/training:/app/data   # training CSVs visible at data/training/
     env_file:
       - .env
     restart: unless-stopped
@@ -30,11 +36,13 @@ services:
     ports:
       - "8002:8002"
     volumes:
-      - ./models:/app/models
-      - training_data:/app/data
+      - ./models:/app/models                  # trained model .joblib files
+      - ./data/training:/app/data             # shared training data with data_service
+      - ./data/forecast:/app/data/forecast    # forecast.db visible at data/forecast/
     environment:
       - DATA_SERVICE_URL=http://data_service:8001
       - MODEL_DIR=models
+      - FORECAST_DB_PATH=data/forecast/forecast.db
     depends_on:
       - data_service
     restart: unless-stopped
@@ -57,7 +65,7 @@ services:
     ports:
       - "8003:8003"
     volumes:
-      - trading_data:/app/data
+      - ./data/trading:/app/data    # trading.db visible at data/trading/
     environment:
       - FORECAST_SERVICE_URL=http://forecast:8002
       - RAG_SERVICE_URL=http://rag:8004
@@ -68,7 +76,9 @@ services:
     restart: unless-stopped
 
   dashboard:
-    build: ./dashboard
+    build:
+      context: .                        # project root — lets Dockerfile reach src/
+      dockerfile: dashboard/Dockerfile
     ports:
       - "8501:8501"
     environment:
@@ -84,7 +94,6 @@ services:
     restart: unless-stopped
 
   # Scheduler: triggers the pipeline every 15 minutes
-  # Replaces the old forecast_cron service
   # Runs: fetch weather → fetch ERCOT → run forecast → execute trade → refresh news
   scheduler:
     build: ./scheduler
@@ -99,7 +108,3 @@ services:
       - trading
       - rag
     restart: unless-stopped
-
-volumes:
-  trading_data:
-  training_data:

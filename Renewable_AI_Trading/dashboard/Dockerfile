@@ -4,10 +4,13 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y curl && apt-get clean
 
-COPY requirements.txt .
+# Build context is the project root (set in docker-compose.yml)
+# so all paths below are relative to Renewable_AI_Trading/
+COPY dashboard/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+COPY dashboard/app.py .
+COPY dashboard/backtest_engine.py .
 
 EXPOSE 8501
 

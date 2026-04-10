@@ -37,6 +37,7 @@ from datetime import datetime
 from fastapi import FastAPI, HTTPException
 
 from ensemble_forecaster import EnsembleForecaster
+from database import ForecastDatabase
 
 # ─── Setup ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,7 +54,14 @@ app = FastAPI(
 
 # ─── Configuration ──────────────────────────────────────────
 DATA_SERVICE_URL = os.getenv("DATA_SERVICE_URL", "http://data_service:8001")
-MODEL_DIR = os.getenv("MODEL_DIR", "models")
+MODEL_DIR        = os.getenv("MODEL_DIR", "models")
+DB_PATH          = os.getenv("FORECAST_DB_PATH", "data/forecast.db")
+
+# ─── Persistent Forecast Database ───────────────────────────
+# Replaces the in-memory forecast_history [] list.
+# Records survive container restarts via the forecast_data Docker volume.
+db = ForecastDatabase(DB_PATH)
+logger.info(f"Forecast DB ready at {DB_PATH} ({db.count()} existing records)")
 
 # ─── Feature Lists (must match train_ensemble.py v4) ────────
 WEATHER_FEATURES = [
@@ -94,13 +102,19 @@ def load_models():
 
 load_models()
 
-# ─── In-Memory History (for lag computation) ─────────────────
+# ─── In-Memory Buffers ──────────────────────────────────────
+# latest_forecast: cached in RAM for the fast /forecast/latest endpoint
+#                  (avoids a DB read on every dashboard refresh)
+# forecast_history: REMOVED — now persisted in forecast.db via `db`
+#
+# price_history / demand_history: still in-memory — these are used only
+# for computing lag features at inference time and do not need to persist
+# across restarts (the data service provides real ERCOT history on startup).
 latest_forecast = {}
-forecast_history = []
 
 # Store recent prices and demand predictions for lag features
 # Each entry: {"timestamp": ..., "price": ..., "demand": ...}
-price_history = []    # last 200 hourly prices from ERCOT
+price_history  = []   # last 200 hourly prices from ERCOT
 demand_history = []   # last 200 hourly demand values
 
 
@@ -163,7 +177,7 @@ def fetch_forecast_demand_history():
     we use our stored predictions as proxy.
     """
     demands = []
-    for f in forecast_history[-200:]:
+    for f in db.get_history(limit=200, order="asc"):
         demand_data = f.get("demand", {})
         if "predicted" in demand_data:
             demands.append({
@@ -370,7 +384,7 @@ def health():
             "price": price_model.is_trained,
             "demand": demand_model.is_trained,
         },
-        "forecast_count": len(forecast_history),
+        "forecast_count": db.count(),
         "price_history_depth": len(price_history),
         "demand_history_depth": len(demand_history),
     }
@@ -514,9 +528,9 @@ def run_forecast():
         demand_predicted=results.get("demand", {}).get("predicted"),
     )
 
-    # Store forecast
+    # Persist forecast to SQLite and update in-memory latest cache
     latest_forecast = results
-    forecast_history.append(results)
+    db.save_forecast(results)
 
     logger.info(
         f"Forecast complete: energy={results.get('energy_output', {}).get('predicted')}MW, "
@@ -528,19 +542,33 @@ def run_forecast():
 
 @app.get("/forecast/latest")
 def get_latest_forecast():
-    """Return the most recent forecast."""
-    if not latest_forecast:
+    """Return the most recent forecast — served from in-memory cache for speed."""
+    if latest_forecast:
+        return latest_forecast
+    # Fallback: read from DB on first request after a cold restart
+    record = db.get_latest()
+    if record is None:
         raise HTTPException(
             status_code=404,
             detail="No forecast available. Call POST /forecast/run first."
         )
-    return latest_forecast
+    return record
 
 
 @app.get("/forecast/history")
-def get_forecast_history(limit: int = 50):
-    """Return recent forecast history. Used by dashboard for trend charts."""
-    return forecast_history[-limit:]
+def get_forecast_history(limit: int = 96):
+    """
+    Return recent forecast history from the persistent SQLite database.
+    Newest first (desc) so the dashboard chart and backtest engine both
+    receive the same ordering they previously expected from the in-memory list.
+    """
+    return db.get_history(limit=limit, order="desc")
+
+
+@app.get("/forecast/count")
+def get_forecast_count():
+    """Return total number of stored forecast records."""
+    return {"count": db.count()}
 
 
 @app.get("/models/metrics")
@@ -763,9 +791,9 @@ def retrain_models(min_rows: int = 200):
     for name, feats, y in targets:
         try:
             X = df[feats]
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, random_state=42
-            )
+            split_idx = int(len(X) * 0.8)
+            X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+            y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
 
             model = EnsembleForecaster(name, n_estimators=100)
             metrics = model.train(X_train, y_train, X_val, y_val)
