@@ -4,14 +4,20 @@
 # On every push to main, syncs the repo to your HF Space.
 # HF then builds the Dockerfile and deploys automatically.
 #
+# Uses huggingface_hub Python API (not git push) to handle
+# binary files (models, db) via HF's Xet storage automatically.
+#
 # REQUIRED GITHUB SECRETS:
-#   HFToken   — Hugging Face write access token
+#   HFTOKEN   — Hugging Face write access token
 #              (generate at https://huggingface.co/settings/tokens)
 #
 # REQUIRED HF SPACE SECRETS (set in Space Settings > Variables):
 #   ERCOT_SUBSCRIPTION_KEY
 #   ERCOT_USERNAME
 #   ERCOT_PASSWORD
+#   ERCOT_SUBSCRIPTION_KEY_RT
+#   ERCOT_USERNAME_RT
+#   ERCOT_PASSWORD_RT
 #   GEMINI_API_KEY
 # ============================================================
 
@@ -32,9 +38,23 @@ jobs:
           fetch-depth: 0
           lfs: true
 
+      - name: Install huggingface_hub with Xet support
+        run: pip install "huggingface_hub[hf_xet]" hf_xet
+
       - name: Push to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HFTOKEN }}
         run: |
-          git remote add hf https://Alok2805:$HF_TOKEN@huggingface.co/spaces/Alok2805/Trading0System || true
-          git push hf main --force
+          python - <<'EOF'
+          import os
+          from huggingface_hub import HfApi
+
+          api = HfApi(token=os.environ["HF_TOKEN"])
+          api.upload_folder(
+              folder_path=".",
+              repo_id="Alok2805/Trading0System",
+              repo_type="space",
+              ignore_patterns=[".git/*", ".github/*", "node_modules/*"],
+          )
+          print("Successfully deployed to HF Space!")
+          EOF
