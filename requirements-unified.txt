@@ -3,9 +3,9 @@
 # ============================================================
 
 # --- Web frameworks (data, forecast, trading, rag services) ---
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.3
+fastapi==0.115.6
+uvicorn==0.32.1
+pydantic==2.10.4
 
 # --- HTTP client (all services) ---
 requests==2.31.0
