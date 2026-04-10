@@ -36,5 +36,5 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HFToken }}
         run: |
-          git remote add hf https://aloksharma28:$HF_TOKEN@huggingface.co/spaces/aloksharma28/energy-trading-platform || true
+          git remote add hf https://Alok2805:$HF_TOKEN@huggingface.co/spaces/Alok2805/Trading0System || true
           git push hf main --force
