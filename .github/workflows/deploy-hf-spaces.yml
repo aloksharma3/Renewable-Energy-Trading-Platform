@@ -5,7 +5,7 @@
 # HF then builds the Dockerfile and deploys automatically.
 #
 # REQUIRED GITHUB SECRETS:
-#   HF_TOKEN  — Hugging Face write access token
+#   HFToken   — Hugging Face write access token
 #              (generate at https://huggingface.co/settings/tokens)
 #
 # REQUIRED HF SPACE SECRETS (set in Space Settings > Variables):
@@ -34,7 +34,7 @@ jobs:
 
       - name: Push to Hugging Face Space
         env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_TOKEN: ${{ secrets.HFToken }}
         run: |
           git remote add hf https://aloksharma28:$HF_TOKEN@huggingface.co/spaces/aloksharma28/energy-trading-platform || true
           git push hf main --force
